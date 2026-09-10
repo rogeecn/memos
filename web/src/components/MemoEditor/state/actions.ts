@@ -1,7 +1,5 @@
-import type { Attachment } from "@/types/proto/api/v1/attachment_service_pb";
-import type { MemoRelation } from "@/types/proto/api/v1/memo_service_pb";
 import type { LocalFile } from "../types/attachment";
-import type { AudioRecorderPermission, AudioRecorderStatus, EditorAction, EditorState, LoadingKey } from "./types";
+import type { EditorAction, EditorState, LoadingKey } from "./types";
 
 export const editorActions = {
   initMemo: (payload: { content: string; metadata: EditorState["metadata"]; timestamps: EditorState["timestamps"] }): EditorAction => ({
@@ -11,32 +9,17 @@ export const editorActions = {
 
   updateContent: (content: string): EditorAction => ({
     type: "UPDATE_CONTENT",
-    payload: content,
+    payload: { content, source: "editor" },
+  }),
+
+  setContent: (content: string): EditorAction => ({
+    type: "UPDATE_CONTENT",
+    payload: { content, source: "external" },
   }),
 
   setMetadata: (metadata: Partial<EditorState["metadata"]>): EditorAction => ({
     type: "SET_METADATA",
     payload: metadata,
-  }),
-
-  addAttachment: (attachment: Attachment): EditorAction => ({
-    type: "ADD_ATTACHMENT",
-    payload: attachment,
-  }),
-
-  removeAttachment: (name: string): EditorAction => ({
-    type: "REMOVE_ATTACHMENT",
-    payload: name,
-  }),
-
-  addRelation: (relation: MemoRelation): EditorAction => ({
-    type: "ADD_RELATION",
-    payload: relation,
-  }),
-
-  removeRelation: (name: string): EditorAction => ({
-    type: "REMOVE_RELATION",
-    payload: name,
   }),
 
   addLocalFile: (file: LocalFile): EditorAction => ({
@@ -54,10 +37,6 @@ export const editorActions = {
     payload: files,
   }),
 
-  clearLocalFiles: (): EditorAction => ({
-    type: "CLEAR_LOCAL_FILES",
-  }),
-
   toggleFocusMode: (): EditorAction => ({
     type: "TOGGLE_FOCUS_MODE",
   }),
@@ -67,8 +46,8 @@ export const editorActions = {
     payload: { key, value },
   }),
 
-  setComposing: (value: boolean): EditorAction => ({
-    type: "SET_COMPOSING",
+  setPendingInlineImageInsertions: (value: number): EditorAction => ({
+    type: "SET_PENDING_INLINE_IMAGE_INSERTIONS",
     payload: value,
   }),
 
@@ -77,28 +56,13 @@ export const editorActions = {
     payload: timestamps,
   }),
 
-  setAudioRecorderSupport: (value: boolean): EditorAction => ({
-    type: "SET_AUDIO_RECORDER_SUPPORT",
+  setJustSaved: (value: boolean): EditorAction => ({
+    type: "SET_JUST_SAVED",
     payload: value,
   }),
 
-  setAudioRecorderPermission: (value: AudioRecorderPermission): EditorAction => ({
-    type: "SET_AUDIO_RECORDER_PERMISSION",
-    payload: value,
-  }),
-
-  setAudioRecorderStatus: (value: AudioRecorderStatus): EditorAction => ({
-    type: "SET_AUDIO_RECORDER_STATUS",
-    payload: value,
-  }),
-
-  setAudioRecorderElapsed: (value: number): EditorAction => ({
-    type: "SET_AUDIO_RECORDER_ELAPSED",
-    payload: value,
-  }),
-
-  setAudioRecorderError: (value?: string): EditorAction => ({
-    type: "SET_AUDIO_RECORDER_ERROR",
+  setRecorderBusy: (value: boolean): EditorAction => ({
+    type: "SET_RECORDER_BUSY",
     payload: value,
   }),
 

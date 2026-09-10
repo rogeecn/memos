@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -11,12 +12,7 @@ import (
 )
 
 func (d *DB) CreateUser(ctx context.Context, create *store.User) (*store.User, error) {
-	fields := []string{"`username`", "`role`", "`email`", "`nickname`", "`password_hash`", "`avatar_url`"}
-	placeholder := []string{"?", "?", "?", "?", "?", "?"}
-	args := []any{create.Username, create.Role, create.Email, create.Nickname, create.PasswordHash, create.AvatarURL}
-
-	stmt := "INSERT INTO user (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ")"
-	result, err := d.db.ExecContext(ctx, stmt, args...)
+	result, err := insertUser(ctx, d.db, create)
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +35,16 @@ func (d *DB) CreateUser(ctx context.Context, create *store.User) (*store.User, e
 }
 
 func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.User, error) {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if update.RowStatus != nil && *update.RowStatus == store.Archived {
+		if err := validateMySQLUserArchive(ctx, tx, update.ID); err != nil {
+			return nil, err
+		}
+	}
 	set, args := []string{}, []any{}
 	if v := update.UpdatedTs; v != nil {
 		set, args = append(set, "`updated_ts` = FROM_UNIXTIME(?)"), append(args, *v)
@@ -70,20 +76,52 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 	args = append(args, update.ID)
 
 	query := "UPDATE `user` SET " + strings.Join(set, ", ") + " WHERE `id` = ?"
-	if _, err := d.db.ExecContext(ctx, query, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return nil, err
 	}
-
-	user, err := d.GetUser(ctx, &store.FindUser{ID: &update.ID})
-	if err != nil {
+	user := &store.User{}
+	if err := tx.QueryRowContext(ctx, `SELECT id, username, role, email, nickname, password_hash, avatar_url, description,
+		UNIX_TIMESTAMP(created_ts), UNIX_TIMESTAMP(updated_ts), row_status FROM user WHERE id = ?`, update.ID).Scan(
+		&user.ID, &user.Username, &user.Role, &user.Email, &user.Nickname, &user.PasswordHash, &user.AvatarURL,
+		&user.Description, &user.CreatedTs, &user.UpdatedTs, &user.RowStatus,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return user, nil
 }
 
+func validateMySQLUserArchive(ctx context.Context, tx *sql.Tx, userID int32) error {
+	var current store.RowStatus
+	if err := tx.QueryRowContext(ctx, "SELECT row_status FROM user WHERE id = ?", userID).Scan(&current); err != nil {
+		return err
+	}
+	if current != store.Normal {
+		return nil
+	}
+	var wouldLoseAdmin bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM space_member target
+		JOIN space s ON s.id = target.space_id
+		WHERE target.user_id = ? AND target.status = 'ACTIVE' AND target.role = 'ADMIN'
+		AND NOT EXISTS (
+			SELECT 1 FROM space_member other JOIN user u ON u.id = other.user_id
+			WHERE other.space_id = target.space_id AND other.user_id <> ?
+			AND other.status = 'ACTIVE' AND other.role = 'ADMIN' AND u.row_status = 'NORMAL'
+		))`, userID, userID).Scan(&wouldLoseAdmin); err != nil {
+		return err
+	}
+	if wouldLoseAdmin {
+		return store.ErrLastSpaceAdmin
+	}
+	return nil
+}
+
 func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User, error) {
 	where, args := []string{"1 = 1"}, []any{}
-	orderBy := []string{"`created_ts` DESC", "`row_status` DESC"}
+	orderBy := []string{"`created_ts` DESC", "`row_status` DESC", "`id` DESC"}
 
 	if len(find.Filters) > 0 {
 		return nil, errors.Errorf("user filters are not supported")
@@ -147,6 +185,9 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 	query := "SELECT `id`, `username`, `role`, `email`, `nickname`, `password_hash`, `avatar_url`, `description`, UNIX_TIMESTAMP(`created_ts`), UNIX_TIMESTAMP(`updated_ts`), `row_status` FROM `user` WHERE " + strings.Join(where, " AND ") + " ORDER BY " + strings.Join(orderBy, ", ")
 	if v := find.Limit; v != nil {
 		query += fmt.Sprintf(" LIMIT %d", *v)
+		if v := find.Offset; v != nil {
+			query += fmt.Sprintf(" OFFSET %d", *v)
+		}
 	}
 	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -191,15 +232,4 @@ func (d *DB) GetUser(ctx context.Context, find *store.FindUser) (*store.User, er
 		return nil, errors.Errorf("unexpected user count: %d", len(list))
 	}
 	return list[0], nil
-}
-
-func (d *DB) DeleteUser(ctx context.Context, delete *store.DeleteUser) error {
-	result, err := d.db.ExecContext(ctx, "DELETE FROM `user` WHERE `id` = ?", delete.ID)
-	if err != nil {
-		return err
-	}
-	if _, err := result.RowsAffected(); err != nil {
-		return err
-	}
-	return nil
 }

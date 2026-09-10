@@ -22,6 +22,8 @@ enum InstanceSettingKey {
   NOTIFICATION = 6;
   // AI is the key for AI provider settings.
   AI = 7;
+  // ACCESS is the key for instance access policy settings.
+  ACCESS = 8;
 }
 
 message InstanceSetting {
@@ -34,6 +36,7 @@ message InstanceSetting {
     InstanceTagsSetting tags_setting = 6;
     InstanceNotificationSetting notification_setting = 7;
     InstanceAISetting ai_setting = 8;
+    InstanceAccessSetting access_setting = 9;
   }
 }
 
@@ -71,7 +74,31 @@ message InstanceCustomProfile {
   string logo_url = 3;
 }
 
+enum StorageType {
+  STORAGE_TYPE_UNSPECIFIED = 0;
+  // DATABASE stores attachment content in the application database.
+  STORAGE_TYPE_DATABASE = 1;
+  // LOCAL stores attachment content on the local filesystem.
+  STORAGE_TYPE_LOCAL = 2;
+  // S3 stores attachment content in an S3-compatible object store.
+  STORAGE_TYPE_S3 = 3;
+}
+
+// Storage is a configured attachment storage instance.
+message Storage {
+  // id is the stable identifier referenced by attachments.
+  string id = 1;
+  // name is the human-readable storage name.
+  string name = 2;
+  StorageType type = 3;
+
+  oneof config {
+    StorageS3Config s3_config = 10;
+  }
+}
+
 message InstanceStorageSetting {
+  // Legacy storage type enum retained for compatibility with existing settings.
   enum StorageType {
     STORAGE_TYPE_UNSPECIFIED = 0;
     // STORAGE_TYPE_DATABASE is the database storage type.
@@ -81,15 +108,20 @@ message InstanceStorageSetting {
     // STORAGE_TYPE_S3 is the S3 storage type.
     S3 = 3;
   }
-  // storage_type is the storage type.
+  // Legacy compatibility field. New code uses default_storage_id.
   StorageType storage_type = 1;
   // The template of file path.
   // e.g. assets/{timestamp}_{filename}
   string filepath_template = 2;
   // The max upload size in megabytes.
   int64 upload_size_limit_mb = 3;
-  // The S3 config.
+  // Legacy compatibility field. New code uses storages.
   StorageS3Config s3_config = 4;
+  // storages contains configured storage instances, including inactive instances
+  // that may still be referenced by existing attachments.
+  repeated Storage storages = 5;
+  // default_storage_id identifies the storage used for new attachments.
+  string default_storage_id = 6;
 }
 
 // Reference: https://developers.cloudflare.com/r2/examples/aws/aws-sdk-go/
@@ -100,11 +132,15 @@ message StorageS3Config {
   string region = 4;
   string bucket = 5;
   bool use_path_style = 6;
+  // insecure_skip_tls_verify disables TLS certificate verification when connecting
+  // to the S3 endpoint. Only enable this for trusted endpoints that use a self-signed
+  // certificate; it removes protection against man-in-the-middle attacks.
+  bool insecure_skip_tls_verify = 7;
 }
 
 message InstanceMemoRelatedSetting {
-  // display_with_update_time orders and displays memo with update time.
-  bool display_with_update_time = 2;
+  reserved 2;
+  reserved "display_with_update_time";
   // content_length_limit is the limit of content length. Unit is byte.
   int32 content_length_limit = 3;
   // enable_double_click_edit enables editing on double click.
@@ -121,6 +157,8 @@ message InstanceTagMetadata {
   bool blur_content = 2;
 }
 
+// Active tag metadata is stored in per-user tag settings.
+// This message remains for backward compatibility with existing clients and migrations.
 message InstanceTagsSetting {
   // Map of tag name pattern to tag metadata.
   // Each key is treated as an anchored regular expression (^pattern$),
@@ -149,6 +187,10 @@ message InstanceNotificationSetting {
 message InstanceAISetting {
   // providers is the list of AI provider configurations available instance-wide.
   repeated AIProviderConfig providers = 1;
+
+  // transcription is the speech-to-text feature configuration.
+  // When unset or transcription.provider_id is empty, transcription is disabled.
+  TranscriptionConfig transcription = 2;
 }
 
 message AIProviderConfig {
@@ -164,4 +206,42 @@ enum AIProviderType {
   AI_PROVIDER_TYPE_UNSPECIFIED = 0;
   OPENAI = 1;
   GEMINI = 2;
+}
+
+// TranscriptionConfig configures the speech-to-text feature.
+message TranscriptionConfig {
+  // provider_id references an entry in InstanceAISetting.providers[].id.
+  // Empty string means transcription is disabled.
+  string provider_id = 1;
+
+  // model is the provider-specific model identifier.
+  // Empty string falls back to the engine default.
+  // OPENAI examples:
+  //   - whisper-1 (legacy, lower cost)
+  //   - gpt-4o-transcribe, gpt-4o-mini-transcribe (higher quality)
+  //   - gpt-4o-transcribe-diarize (includes speaker labels)
+  // GEMINI examples:
+  //   - gemini-2.5-flash (default, multimodal call)
+  //   - gemini-2.5-pro
+  string model = 2;
+
+  // language is the default ISO 639-1 language hint sent to the provider.
+  // Empty string lets the provider auto-detect.
+  string language = 3;
+
+  // prompt is a default spelling/vocabulary hint passed to the provider.
+  // Used as the OpenAI Whisper "prompt" parameter (a soft hint that the model
+  // may ignore) and folded into the Gemini generation prompt as a "Context and
+  // spelling hints" block (which the LLM will treat more literally).
+  string prompt = 4;
+}
+
+enum InstanceAccessMode {
+  INSTANCE_ACCESS_MODE_UNSPECIFIED = 0;
+  INSTANCE_ACCESS_MODE_PRIVATE = 1;
+  INSTANCE_ACCESS_MODE_PUBLIC = 2;
+}
+
+message InstanceAccessSetting {
+  InstanceAccessMode access_mode = 1;
 }

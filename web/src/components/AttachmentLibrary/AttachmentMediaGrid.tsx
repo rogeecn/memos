@@ -1,9 +1,12 @@
 import { PlayIcon } from "lucide-react";
 import MotionPhotoPreview from "@/components/MotionPhotoPreview";
 import { Badge } from "@/components/ui/badge";
+import VideoPoster from "@/components/VideoPoster";
 import type { AttachmentLibraryMediaItem, AttachmentLibraryMonthGroup } from "@/hooks/useAttachmentLibrary";
+import { cn } from "@/lib/utils";
 import { useTranslate } from "@/utils/i18n";
-import { AttachmentMetadataLine, AttachmentOpenButton } from "./AttachmentLibraryPrimitives";
+import { formatMediaDuration } from "@/utils/media-metadata";
+import { AttachmentMetadataLine, AttachmentOpenButton, AttachmentSourceChip } from "./AttachmentLibraryPrimitives";
 
 interface AttachmentMediaGridProps {
   groups: AttachmentLibraryMonthGroup[];
@@ -12,17 +15,30 @@ interface AttachmentMediaGridProps {
 
 const AttachmentMediaCard = ({ item, onPreview }: { item: AttachmentLibraryMediaItem; onPreview: () => void }) => {
   const t = useTranslate();
+  const videoDuration = item.attachments.map((attachment) => attachment.mediaMetadata?.details).find((details) => details?.case === "video")
+    ?.value.durationSeconds;
 
   return (
     <article className="overflow-hidden rounded-[20px] border border-border/60 bg-background/90 shadow-sm shadow-black/[0.03]">
-      <button type="button" className="relative block w-full cursor-pointer text-left" onClick={onPreview}>
+      <div className="relative block w-full cursor-pointer text-left" onClick={onPreview}>
         <div className="relative aspect-[5/4] overflow-hidden bg-muted/40">
           {item.kind === "video" ? (
             <>
-              <video src={item.sourceUrl} poster={item.posterUrl} className="h-full w-full object-cover" preload="metadata" />
+              <VideoPoster
+                sourceUrl={item.sourceUrl}
+                posterUrl={item.posterUrl}
+                alt={item.filename}
+                className="h-full w-full object-cover"
+              />
               <div className="absolute inset-0 bg-linear-to-t from-black/35 via-black/5 to-transparent" />
-              <span className="absolute bottom-2.5 right-2.5 inline-flex h-8 w-8 items-center justify-center rounded-full bg-background/85 text-foreground shadow-sm backdrop-blur-sm">
+              <span
+                className={cn(
+                  "absolute bottom-2.5 right-2.5 inline-flex h-8 items-center justify-center rounded-full bg-background/85 text-foreground shadow-sm backdrop-blur-sm",
+                  videoDuration === undefined ? "w-8" : "gap-1.5 px-2.5 text-[11px] font-medium tabular-nums",
+                )}
+              >
                 <PlayIcon className="h-3.5 w-3.5 fill-current" />
+                {videoDuration !== undefined && <span>{formatMediaDuration(videoDuration)}</span>}
               </span>
             </>
           ) : item.kind === "motion" ? (
@@ -39,7 +55,7 @@ const AttachmentMediaCard = ({ item, onPreview }: { item: AttachmentLibraryMedia
             <img src={item.posterUrl} alt={item.filename} className="h-full w-full object-cover" loading="lazy" decoding="async" />
           )}
         </div>
-      </button>
+      </div>
 
       <div className="flex flex-col gap-2 p-3">
         <div className="flex items-start justify-between gap-2">
@@ -54,12 +70,12 @@ const AttachmentMediaCard = ({ item, onPreview }: { item: AttachmentLibraryMedia
           )}
         </div>
 
+        <AttachmentMetadataLine
+          className="min-w-0"
+          items={[item.fileTypeLabel, item.createdLabel !== "—" ? item.createdLabel : undefined]}
+        />
         <div className="flex items-center justify-between gap-2">
-          <AttachmentMetadataLine
-            className="min-w-0 flex-1"
-            items={[item.fileTypeLabel, item.createdLabel !== "—" ? item.createdLabel : undefined]}
-          />
-
+          <AttachmentSourceChip memoName={item.memoName} />
           <AttachmentOpenButton href={item.sourceUrl} />
         </div>
       </div>

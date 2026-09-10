@@ -23,7 +23,6 @@
     "archive": "الأرشيف",
     "archived": "المؤرشفة",
     "attachments": "مرفقات",
-    "auto-expand": "توسيع تلقائي",
     "avatar": "الصورة الشخصية",
     "basic": "بسيط",
     "beta": "تجريبي",
@@ -65,6 +64,7 @@
     "last-updated-at": "آخر تحديث في",
     "learn-more": "تعلم المزيد",
     "link": "الرابط",
+    "manage": "إدارة",
     "map": "خريطة",
     "mark": "تعليم",
     "memo": "مذكرة",
@@ -95,8 +95,6 @@
     "select": "تحديد",
     "settings": "الإعدادات",
     "share": "مشاركة",
-    "shortcut-filter": "تصفية الاختصارات",
-    "shortcuts": "اختصارات",
     "sign-in": "تسجيل الدخول",
     "sign-in-with": "تسجيل دخول بواسطة {{provider}}",
     "sign-out": "تسجيل خروج",
@@ -114,7 +112,11 @@
     "username": "اسم المستخدم",
     "version": "الإصدار",
     "visibility": "الرؤية",
+    "views": "طرق العرض",
     "yourself": "نفسك"
+  },
+  "locale-picker": {
+    "no-language-feedback": "لم يتم العثور على اللغة؟ إرسال ردود الفعل"
   },
   "editor": {
     "add-your-comment-here": "أضف تعليقك هنا...",
@@ -123,8 +125,6 @@
     "focus-mode": "وضع التركيز",
     "no-changes-detected": "لم يتم الكشف عن تغييرات",
     "save": "حفظ",
-    "saving": "جارِ الحفظ...",
-    "slash-commands": "اكتب `/` للأوامر",
     "insert-menu": {
       "add-location": "أضف الموقع",
       "link-memo": "مذكرة الارتباط",
@@ -189,9 +189,12 @@
     "filters": {
       "has-code": "يحتوي على كود",
       "has-link": "يحتوي على رابط",
+      "has-location": "يحتوي على موقع",
       "has-task-list": "يحتوي على قائمة مهام",
       "label": "المرشحات"
     },
+    "compact-mode": "الوضع المضغوط",
+    "link-preview": "معاينة الرابط",
     "links": "روابط",
     "load-more": "تحميل المزيد",
     "no-archived-memos": "لا يوجد مذكرات مؤرشفة",
@@ -253,8 +256,7 @@
     "restored-successfully": "تمت الاستعادة بنجاح",
     "succeed-copy-content": "تم نسخ المحتوى بنجاح.",
     "succeed-copy-link": "تم نسخ الرابط بنجاح.",
-    "update-succeed": "تم التحديث بنجاح",
-    "user-not-found": "المستخدم غير موجود"
+    "update-succeed": "تم التحديث بنجاح"
   },
   "reference": {
     "add-references": "إضافة مراجع",
@@ -330,9 +332,9 @@
       "theme": "السمة",
       "label": "التفضيلات"
     },
-    "shortcut": {
-      "delete-confirm": "هل أنت متأكد من حذف الاختصار `{{title}}`؟",
-      "delete-success": "تم حذف الاختصار `{{title}}` بنجاح"
+    "memo-view": {
+      "delete-confirm": "هل أنت متأكد من حذف طريقة العرض `{{title}}`؟",
+      "delete-success": "تم حذف طريقة العرض `{{title}}` بنجاح"
     },
     "sso": {
       "authorization-endpoint": "نقطة نهاية التفويض",
@@ -374,7 +376,6 @@
       "path": "مسار التخزين",
       "path-description": "يمكنك استخدام نفس المتغيرات الديناميكية من التخزين المحلي، مثل {filename}",
       "path-placeholder": "مسار/مخصص",
-      "presign-placeholder": "رابط توقيع مسبق، اختياري",
       "region": "المنطقة",
       "region-placeholder": "اسم المنطقة",
       "s3-compatible-url": "رابط متوافق مع S3",

@@ -1,7 +1,7 @@
-import { LatLng } from "leaflet";
 import { MapPinIcon } from "lucide-react";
 import { useState } from "react";
-import { LocationPicker } from "@/components/map";
+import { LazyLocationPicker } from "@/components/map/LazyLocationPicker";
+import { FOCUS_VISIBLE_OUTLINE_CLASSES } from "@/components/ui/focus";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import type { Location } from "@/types/proto/api/v1/memo_service_pb";
@@ -9,10 +9,9 @@ import { getLocationCoordinatesText, getLocationDisplayText } from "./locationHe
 
 interface LocationDisplayViewProps {
   location?: Location;
-  className?: string;
 }
 
-const LocationDisplayView = ({ location, className }: LocationDisplayViewProps) => {
+const LocationDisplayView = ({ location }: LocationDisplayViewProps) => {
   const [popoverOpen, setPopoverOpen] = useState<boolean>(false);
 
   if (!location) {
@@ -23,25 +22,32 @@ const LocationDisplayView = ({ location, className }: LocationDisplayViewProps) 
 
   return (
     <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className={cn(
-            "w-full flex flex-row gap-2 cursor-pointer",
-            "relative inline-flex items-center gap-1.5 px-2 h-7 rounded-md border border-border bg-muted/20 hover:bg-accent/20 text-muted-foreground hover:text-foreground text-xs transition-colors",
-            className,
-          )}
-        >
-          <span className="shrink-0 text-muted-foreground">
-            <MapPinIcon className="w-3.5 h-3.5" />
-          </span>
-          <span className="text-nowrap opacity-80">[{getLocationCoordinatesText(location, 2)}]</span>
-          <span className="text-nowrap truncate">{displayText}</span>
-        </button>
+      <PopoverTrigger
+        render={
+          <button
+            type="button"
+            title={displayText}
+            className={cn(
+              "inline-flex min-h-7 max-w-full min-w-0 items-center gap-1.5 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground data-popup-open:text-foreground",
+              FOCUS_VISIBLE_OUTLINE_CLASSES,
+            )}
+          />
+        }
+      >
+        <MapPinIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="min-w-0 truncate">{displayText}</span>
       </PopoverTrigger>
-      <PopoverContent align="start">
-        <div className="min-w-80 sm:w-lg flex flex-col justify-start items-start">
-          <LocationPicker latlng={new LatLng(location.latitude, location.longitude)} readonly={true} />
+      <PopoverContent align="start" className="w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl p-0">
+        {popoverOpen && (
+          <LazyLocationPicker
+            latlng={{ lat: location.latitude, lng: location.longitude }}
+            readonly
+            className="h-52 rounded-none border-0 shadow-none"
+          />
+        )}
+        <div className="space-y-1 px-3 py-2.5">
+          {location.placeholder.trim() && <p className="wrap-anywhere text-sm font-medium">{displayText}</p>}
+          <p className="text-xs tabular-nums text-muted-foreground">{getLocationCoordinatesText(location, 6)}</p>
         </div>
       </PopoverContent>
     </Popover>

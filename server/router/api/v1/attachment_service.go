@@ -3,54 +3,37 @@ package v1
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
-	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/disintegration/imaging"
-	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/usememos/memos/internal/filter"
 	"github.com/usememos/memos/internal/motionphoto"
-	"github.com/usememos/memos/internal/profile"
-	"github.com/usememos/memos/internal/storage/s3"
-	"github.com/usememos/memos/internal/util"
 	v1pb "github.com/usememos/memos/proto/gen/api/v1"
 	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
 
 const (
-	// The upload memory buffer is 32 MiB.
-	// It should be kept low, so RAM usage doesn't get out of control.
-	// This is unrelated to maximum upload size limit, which is now set through system setting.
-	MaxUploadBufferSizeBytes = 32 << 20
-	MebiByte                 = 1024 * 1024
-	// ThumbnailCacheFolder is the folder name where the thumbnail images are stored.
-	ThumbnailCacheFolder = ".thumbnail_cache"
+	// DefaultUploadSizeLimitBytes applies when no upload size limit is configured.
+	DefaultUploadSizeLimitBytes = 32 << 20
+	MebiByte                    = 1024 * 1024
 
 	// defaultJPEGQuality is the JPEG quality used when re-encoding images for EXIF stripping.
 	// Quality 95 maintains visual quality while ensuring metadata is removed.
 	defaultJPEGQuality        = 95
 	maxBatchDeleteAttachments = 100
+	maxImagePixels            = 50_000_000
 )
-
-var SupportedThumbnailMimeTypes = []string{
-	"image/png",
-	"image/jpeg",
-}
 
 // exifCapableImageTypes defines image formats that may contain EXIF metadata.
 // These formats will have their EXIF metadata stripped on upload for privacy.
@@ -63,7 +46,34 @@ var exifCapableImageTypes = map[string]bool{
 	"image/heif": true,
 }
 
-func (s *APIV1Service) CreateAttachment(ctx context.Context, request *v1pb.CreateAttachmentRequest) (*v1pb.Attachment, error) {
+// extensionMimeTypeFallbacks maps image extensions that Go's builtin MIME
+// table does not cover. HEIC/HEIF files are the common case: browsers report
+// an empty MIME type for them, Go's builtin table omits the extension, and
+// http.DetectContentType cannot sniff the ISO BMFF container, so without
+// this fallback these uploads are stored as "application/octet-stream" on
+// minimal runtimes that ship no system MIME database (e.g. the Alpine image).
+var extensionMimeTypeFallbacks = map[string]string{
+	".heic": "image/heic",
+	".heif": "image/heif",
+}
+
+// detectAttachmentMimeType resolves the MIME type for an uploaded file that
+// arrived without a client-supplied type. It prefers the filename extension
+// (including the curated fallback above, which keeps the result identical on
+// machines with and without a system MIME database), then sniffs the content
+// as a last resort.
+func detectAttachmentMimeType(filename string, content []byte) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if mimeType, ok := extensionMimeTypeFallbacks[ext]; ok {
+		return mimeType
+	}
+	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+		return mimeType
+	}
+	return http.DetectContentType(content)
+}
+
+func (s *APIV1Service) prepareAttachment(ctx context.Context, request *v1pb.CreateAttachmentRequest) (*store.Attachment, error) {
 	user, err := s.fetchCurrentUser(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get current user: %v", err)
@@ -84,11 +94,7 @@ func (s *APIV1Service) CreateAttachment(ctx context.Context, request *v1pb.Creat
 	}
 	normalizedMimeType := request.Attachment.Type
 	if normalizedMimeType == "" {
-		ext := filepath.Ext(request.Attachment.Filename)
-		mimeType := mime.TypeByExtension(ext)
-		if mimeType == "" {
-			mimeType = http.DetectContentType(request.Attachment.Content)
-		}
+		mimeType := detectAttachmentMimeType(request.Attachment.Filename, request.Attachment.Content)
 		if normalizedType, ok := normalizeMimeType(mimeType); ok {
 			normalizedMimeType = normalizedType
 		}
@@ -122,46 +128,13 @@ func (s *APIV1Service) CreateAttachment(ctx context.Context, request *v1pb.Creat
 		create.Payload = ensureAttachmentPayload(create.Payload)
 		create.Payload.MotionMedia = inputMotionMedia
 	}
-
-	instanceStorageSetting, err := s.Store.GetInstanceStorageSetting(ctx)
+	inputMediaMetadata, err := validateClientMediaMetadata(request.Attachment.MediaMetadata, request.Attachment.Type)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get instance storage setting: %v", err)
+		return nil, err
 	}
-	size := binary.Size(request.Attachment.Content)
-	uploadSizeLimit := int(instanceStorageSetting.UploadSizeLimitMb) * MebiByte
-	if uploadSizeLimit == 0 {
-		uploadSizeLimit = MaxUploadBufferSizeBytes
-	}
-	if size > uploadSizeLimit {
-		return nil, status.Errorf(codes.InvalidArgument, "file size exceeds the limit")
-	}
-	create.Size = int64(size)
-	create.Blob = request.Attachment.Content
-
-	if create.Payload == nil || create.Payload.MotionMedia == nil {
-		if detectedMotion := detectAndroidMotionMedia(create.Blob, create.Type, attachmentUID); detectedMotion != nil {
-			create.Payload = ensureAttachmentPayload(create.Payload)
-			create.Payload.MotionMedia = detectedMotion
-		}
-	}
-
-	// Strip EXIF metadata from images for privacy protection.
-	// This removes sensitive information like GPS location, device details, etc.
-	if shouldStripExif(create.Type) && !isAndroidMotionContainer(create.Payload.GetMotionMedia()) {
-		if strippedBlob, err := stripImageExif(create.Blob, create.Type); err != nil {
-			// Log warning but continue with original image to ensure uploads don't fail.
-			slog.Warn("failed to strip EXIF metadata from image",
-				slog.String("type", create.Type),
-				slog.String("filename", create.Filename),
-				slog.String("error", err.Error()))
-		} else {
-			create.Blob = strippedBlob
-			create.Size = int64(len(strippedBlob))
-		}
-	}
-
-	if err := SaveAttachmentBlob(ctx, s.Profile, s.Store, create); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to save attachment blob: %v", err)
+	if inputMediaMetadata != nil {
+		create.Payload = ensureAttachmentPayload(create.Payload)
+		create.Payload.MediaMetadata = inputMediaMetadata
 	}
 
 	if request.Attachment.Memo != nil {
@@ -176,11 +149,130 @@ func (s *APIV1Service) CreateAttachment(ctx context.Context, request *v1pb.Creat
 		if memo == nil {
 			return nil, status.Errorf(codes.NotFound, "memo not found: %s", *request.Attachment.Memo)
 		}
+		if !canModifyMemo(user, memo) {
+			return nil, status.Errorf(codes.PermissionDenied, "permission denied")
+		}
+		if err := s.requireAssignedMemoWritable(ctx, memo, user.ID); err != nil {
+			return nil, err
+		}
 		create.MemoID = &memo.ID
+		create.Policy = memoWritePolicy(user.ID, false)
 	}
+
+	return create, nil
+}
+
+func (s *APIV1Service) CreateAttachment(ctx context.Context, request *v1pb.CreateAttachmentRequest) (*v1pb.Attachment, error) {
+	create, err := s.prepareAttachment(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	instanceStorageSetting, err := s.Store.GetInstanceStorageSetting(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get instance storage setting: %v", err)
+	}
+	content := request.Attachment.Content
+	if err := checkUploadSize(instanceStorageSetting, int64(len(content))); err != nil {
+		return nil, err
+	}
+	create.Size = int64(len(content))
+	return s.processAndSaveAttachment(ctx, create, instanceStorageSetting, bytes.NewReader(content))
+}
+
+func attachmentUploadLimit(setting *storepb.InstanceStorageSetting) int64 {
+	if setting.UploadSizeLimitMb <= 0 {
+		return DefaultUploadSizeLimitBytes
+	}
+	return min(setting.UploadSizeLimitMb, math.MaxInt64/MebiByte) * MebiByte
+}
+
+func checkUploadSize(setting *storepb.InstanceStorageSetting, size int64) error {
+	if size > attachmentUploadLimit(setting) {
+		return status.Errorf(codes.ResourceExhausted, "file size exceeds the limit")
+	}
+	return nil
+}
+
+// attachmentSource is the file content handed to the processing pipeline: a
+// bytes.Reader for the one-shot RPC, an *os.File for a chunked upload.
+type attachmentSource interface {
+	io.ReadSeeker
+	io.ReaderAt
+}
+
+// processAndSaveAttachment detects motion photos, strips EXIF metadata, stores
+// the content, and creates the database row. create.Size must hold the source
+// length on entry; it is updated when stripping re-encodes the image.
+func (s *APIV1Service) processAndSaveAttachment(ctx context.Context, create *store.Attachment, instanceStorageSetting *storepb.InstanceStorageSetting, source attachmentSource) (*v1pb.Attachment, error) {
+	if create.Payload.GetMotionMedia() == nil && (create.Type == "image/jpeg" || create.Type == "image/jpg") {
+		detected, err := motionphoto.DetectJPEGReader(source, create.Size)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to inspect motion photo: %v", err)
+		}
+		if detected != nil {
+			create.Payload = ensureAttachmentPayload(create.Payload)
+			create.Payload.MotionMedia = &storepb.MotionMedia{
+				Family:                  storepb.MotionMediaFamily_ANDROID_MOTION_PHOTO,
+				Role:                    storepb.MotionMediaRole_CONTAINER,
+				GroupId:                 create.UID,
+				PresentationTimestampUs: detected.PresentationTimestampUs,
+				HasEmbeddedVideo:        true,
+			}
+		}
+	}
+
+	content := io.ReadSeeker(source)
+	// Strip EXIF metadata from images for privacy protection. Motion photo
+	// containers are kept intact because re-encoding would drop the video.
+	if shouldStripExif(create.Type) && !isAndroidMotionContainer(create.Payload.GetMotionMedia()) {
+		release, err := s.acquireImageProcessingSlot(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "too many image processing requests")
+		}
+		stripped, stripErr := stripImageExif(source, create.Type)
+		release()
+		if stripErr != nil {
+			// Log warning but continue with original image to ensure uploads don't fail.
+			slog.Warn("failed to strip EXIF metadata from image",
+				slog.String("type", create.Type),
+				slog.String("filename", create.Filename),
+				slog.String("error", stripErr.Error()))
+		} else {
+			content = bytes.NewReader(stripped)
+			create.Size = int64(len(stripped))
+		}
+	}
+
+	if _, err := content.Seek(0, io.SeekStart); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to rewind attachment content: %v", err)
+	}
+	if err := saveAttachmentContent(ctx, s.Profile, s.Store, create, instanceStorageSetting, content); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to save attachment blob: %v", err)
+	}
+	return s.persistAttachment(ctx, create, instanceStorageSetting)
+}
+
+func (s *APIV1Service) persistAttachment(ctx context.Context, create *store.Attachment, instanceStorageSetting *storepb.InstanceStorageSetting) (*v1pb.Attachment, error) {
 	attachment, err := s.Store.CreateAttachment(ctx, create)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create attachment: %v", err)
+		createErr := mapMemoWriteError(err, "failed to create attachment")
+		persistedObject, cleanupErr := cleanupSavedAttachmentBlob(ctx, s.Store, create, instanceStorageSetting)
+		if cleanupErr != nil {
+			slog.Error("failed to compensate attachment storage after database create failure",
+				slog.String("attachment_uid", create.UID),
+				slog.String("storage_type", create.StorageType.String()),
+				slog.Any("error", cleanupErr),
+			)
+		} else if persistedObject {
+			slog.Warn("attachment create returned an error after its storage object was persisted in the database; skipping compensation",
+				slog.String("attachment_uid", create.UID),
+				slog.String("storage_type", create.StorageType.String()),
+			)
+		}
+		return nil, createErr
+	}
+	if create.MemoID != nil {
+		s.SSEHub.publishMemoChanged()
 	}
 
 	return convertAttachmentFromStore(attachment), nil
@@ -195,14 +287,7 @@ func (s *APIV1Service) ListAttachments(ctx context.Context, request *v1pb.ListAt
 		return nil, status.Errorf(codes.Unauthenticated, "user not authenticated")
 	}
 
-	// Set default page size
-	pageSize := int(request.PageSize)
-	if pageSize <= 0 {
-		pageSize = 50
-	}
-	if pageSize > 1000 {
-		pageSize = 1000
-	}
+	pageSize := normalizePageSize(request.PageSize)
 
 	// Parse page token for offset
 	offset := 0
@@ -216,14 +301,14 @@ func (s *APIV1Service) ListAttachments(ctx context.Context, request *v1pb.ListAt
 
 	findAttachment := &store.FindAttachment{
 		CreatorID: &user.ID,
+		Access:    newMemoAccessScope(user, true),
 		Limit:     &pageSize,
 		Offset:    &offset,
 	}
-
 	// Parse filter if provided
 	if request.Filter != "" {
-		if err := s.validateAttachmentFilter(ctx, request.Filter); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid filter: %v", err)
+		if err := s.validateAttachmentFilterForUser(ctx, request.Filter, user); err != nil {
+			return nil, err
 		}
 		findAttachment.Filters = append(findAttachment.Filters, request.Filter)
 	}
@@ -238,10 +323,6 @@ func (s *APIV1Service) ListAttachments(ctx context.Context, request *v1pb.ListAt
 	for _, attachment := range attachments {
 		response.Attachments = append(response.Attachments, convertAttachmentFromStore(attachment))
 	}
-
-	// For simplicity, set total size to the number of returned attachments.
-	// In a full implementation, you'd want a separate count query
-	response.TotalSize = int32(len(response.Attachments))
 
 	// Set next page token if we got the full page size (indicating there might be more)
 	if len(attachments) == pageSize {
@@ -294,15 +375,16 @@ func (s *APIV1Service) UpdateAttachment(ctx context.Context, request *v1pb.Updat
 	if attachment == nil {
 		return nil, status.Errorf(codes.NotFound, "attachment not found")
 	}
-	// Only the creator or admin can update the attachment.
-	if attachment.CreatorID != user.ID && !isSuperUser(user) {
+	// Only the creator can update the attachment.
+	if attachment.CreatorID != user.ID {
 		return nil, status.Errorf(codes.PermissionDenied, "permission denied")
 	}
 
-	currentTs := time.Now().Unix()
+	currentTsSec := time.Now().Unix()
 	update := &store.UpdateAttachment{
 		ID:        attachment.ID,
-		UpdatedTs: &currentTs,
+		UpdatedTs: &currentTsSec,
+		Policy:    memoWritePolicy(user.ID, false),
 	}
 	for _, field := range request.UpdateMask.Paths {
 		if field == "filename" {
@@ -314,11 +396,23 @@ func (s *APIV1Service) UpdateAttachment(ctx context.Context, request *v1pb.Updat
 	}
 
 	if err := s.Store.UpdateAttachment(ctx, update); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to update attachment: %v", err)
+		return nil, mapMemoWriteError(err, "failed to update attachment")
 	}
-	return s.GetAttachment(ctx, &v1pb.GetAttachmentRequest{
-		Name: request.Attachment.Name,
-	})
+	updatedAttachment, err := s.Store.GetAttachment(ctx, &store.FindAttachment{UID: &attachmentUID})
+	if err != nil {
+		// The update already committed, and the current memo binding is unknown.
+		// Publish conservatively so clients do not retain stale memo state.
+		s.SSEHub.publishMemoChanged()
+		return nil, status.Errorf(codes.Internal, "attachment was updated but failed to reload: %v", err)
+	}
+	if updatedAttachment == nil {
+		s.SSEHub.publishMemoChanged()
+		return nil, status.Error(codes.Internal, "attachment was updated but no longer exists")
+	}
+	if updatedAttachment.MemoID != nil {
+		s.SSEHub.publishMemoChanged()
+	}
+	return convertAttachmentFromStore(updatedAttachment), nil
 }
 
 func (s *APIV1Service) DeleteAttachment(ctx context.Context, request *v1pb.DeleteAttachmentRequest) (*emptypb.Empty, error) {
@@ -343,11 +437,9 @@ func (s *APIV1Service) DeleteAttachment(ctx context.Context, request *v1pb.Delet
 	if attachment == nil {
 		return nil, status.Errorf(codes.NotFound, "attachment not found")
 	}
-	// Delete the attachment from the database.
-	if err := s.Store.DeleteAttachment(ctx, &store.DeleteAttachment{
-		ID: attachment.ID,
-	}); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to delete attachment: %v", err)
+	attachments := []*store.Attachment{attachment}
+	if err := s.deleteAttachmentsAtomically(ctx, user, attachments); err != nil {
+		return nil, err
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -389,287 +481,154 @@ func (s *APIV1Service) BatchDeleteAttachments(ctx context.Context, request *v1pb
 		if attachment == nil {
 			return nil, status.Errorf(codes.NotFound, "attachment not found")
 		}
-		if attachment.CreatorID != user.ID && !isSuperUser(user) {
+		if attachment.CreatorID != user.ID {
 			return nil, status.Errorf(codes.PermissionDenied, "permission denied")
 		}
 		attachments = append(attachments, attachment)
 	}
-
-	if err := s.Store.DeleteAttachments(ctx, attachments); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to delete attachments: %v", err)
+	if err := s.deleteAttachmentsAtomically(ctx, user, attachments); err != nil {
+		return nil, err
 	}
 
 	return &emptypb.Empty{}, nil
 }
 
-func convertAttachmentFromStore(attachment *store.Attachment) *v1pb.Attachment {
-	attachmentMessage := &v1pb.Attachment{
-		Name:        fmt.Sprintf("%s%s", AttachmentNamePrefix, attachment.UID),
-		CreateTime:  timestamppb.New(time.Unix(attachment.CreatedTs, 0)),
-		Filename:    attachment.Filename,
-		Type:        attachment.Type,
-		Size:        attachment.Size,
-		MotionMedia: convertMotionMediaFromStore(getAttachmentMotionMedia(attachment)),
-	}
-	if attachment.MemoUID != nil && *attachment.MemoUID != "" {
-		memoName := fmt.Sprintf("%s%s", MemoNamePrefix, *attachment.MemoUID)
-		attachmentMessage.Memo = &memoName
-	}
-	if attachment.StorageType == storepb.AttachmentStorageType_EXTERNAL || attachment.StorageType == storepb.AttachmentStorageType_S3 {
-		attachmentMessage.ExternalLink = attachment.Reference
-	}
-
-	return attachmentMessage
-}
-
-// SaveAttachmentBlob saves the blob of attachment based on the storage config.
-func SaveAttachmentBlob(ctx context.Context, profile *profile.Profile, stores *store.Store, create *store.Attachment) error {
-	instanceStorageSetting, err := stores.GetInstanceStorageSetting(ctx)
+func (s *APIV1Service) validateAttachmentDeletionPreflight(ctx context.Context, user *store.User, attachments []*store.Attachment) (map[int32]string, error) {
+	deletingUIDs, err := s.validateAttachmentMotionGroupDeletion(ctx, user, attachments)
 	if err != nil {
-		return errors.Wrap(err, "Failed to find instance storage setting")
+		return nil, err
 	}
 
-	if instanceStorageSetting.StorageType == storepb.InstanceStorageSetting_LOCAL {
-		filepathTemplate := "assets/{timestamp}_{uuid}_{filename}"
-		if instanceStorageSetting.FilepathTemplate != "" {
-			filepathTemplate = instanceStorageSetting.FilepathTemplate
+	memos := make(map[int32]*store.Memo)
+	for _, attachment := range attachments {
+		if attachment.MemoID == nil {
+			continue
 		}
-
-		internalPath := filepathTemplate
-		if !strings.Contains(internalPath, "{filename}") {
-			internalPath = filepath.Join(internalPath, "{filename}")
-		}
-		internalPath = replaceFilenameWithPathTemplate(internalPath, create.Filename)
-		internalPath = filepath.ToSlash(internalPath)
-
-		// Ensure the directory exists.
-		osPath := filepath.FromSlash(internalPath)
-		if !filepath.IsAbs(osPath) {
-			osPath = filepath.Join(profile.Data, osPath)
-		}
-		osPath = ensureUniqueLocalAttachmentPath(osPath, create.UID)
-		internalPath = filepath.ToSlash(osPath)
-		if !filepath.IsAbs(filepath.FromSlash(internalPath)) {
-			internalPath, err = filepath.Rel(profile.Data, osPath)
+		memo := memos[*attachment.MemoID]
+		if memo == nil {
+			var err error
+			memo, err = s.Store.GetMemo(ctx, &store.FindMemo{ID: attachment.MemoID})
 			if err != nil {
-				return errors.Wrap(err, "Failed to get relative path")
+				return nil, status.Errorf(codes.Internal, "failed to get attachment memo: %v", err)
 			}
-			internalPath = filepath.ToSlash(internalPath)
-		}
-		dir := filepath.Dir(osPath)
-		if err = os.MkdirAll(dir, os.ModePerm); err != nil {
-			return errors.Wrap(err, "Failed to create directory")
-		}
-
-		// Write the blob to the file.
-		if err := os.WriteFile(osPath, create.Blob, 0644); err != nil {
-			return errors.Wrap(err, "Failed to write file")
-		}
-		create.Reference = internalPath
-		create.Blob = nil
-		create.StorageType = storepb.AttachmentStorageType_LOCAL
-	} else if instanceStorageSetting.StorageType == storepb.InstanceStorageSetting_S3 {
-		s3Config := instanceStorageSetting.S3Config
-		if s3Config == nil {
-			return errors.Errorf("No activated external storage found")
-		}
-		s3Client, err := s3.NewClient(ctx, s3Config)
-		if err != nil {
-			return errors.Wrap(err, "Failed to create s3 client")
-		}
-
-		filepathTemplate := instanceStorageSetting.FilepathTemplate
-		if !strings.Contains(filepathTemplate, "{filename}") {
-			filepathTemplate = filepath.Join(filepathTemplate, "{filename}")
-		}
-		filepathTemplate = replaceFilenameWithPathTemplate(filepathTemplate, create.Filename)
-		key, err := s3Client.UploadObject(ctx, filepathTemplate, create.Type, bytes.NewReader(create.Blob))
-		if err != nil {
-			return errors.Wrap(err, "Failed to upload via s3 client")
-		}
-		presignURL, err := s3Client.PresignGetObject(ctx, key)
-		if err != nil {
-			return errors.Wrap(err, "Failed to presign via s3 client")
-		}
-
-		create.Reference = presignURL
-		create.Blob = nil
-		create.StorageType = storepb.AttachmentStorageType_S3
-		payload := ensureAttachmentPayload(create.Payload)
-		payload.Payload = &storepb.AttachmentPayload_S3Object_{
-			S3Object: &storepb.AttachmentPayload_S3Object{
-				S3Config:          s3Config,
-				Key:               key,
-				LastPresignedTime: timestamppb.New(time.Now()),
-			},
-		}
-		create.Payload = payload
-	}
-
-	return nil
-}
-
-func (s *APIV1Service) GetAttachmentBlob(attachment *store.Attachment) ([]byte, error) {
-	// For local storage, read the file from the local disk.
-	if attachment.StorageType == storepb.AttachmentStorageType_LOCAL {
-		attachmentPath := filepath.FromSlash(attachment.Reference)
-		if !filepath.IsAbs(attachmentPath) {
-			attachmentPath = filepath.Join(s.Profile.Data, attachmentPath)
-		}
-
-		file, err := os.Open(attachmentPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil, errors.Wrap(err, "file not found")
+			if memo == nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "attachment memo no longer exists")
 			}
-			return nil, errors.Wrap(err, "failed to open the file")
+			memos[memo.ID] = memo
 		}
-		defer file.Close()
-		blob, err := io.ReadAll(file)
+		if memo.CreatorID != user.ID {
+			return nil, status.Error(codes.PermissionDenied, "permission denied")
+		}
+	}
+	expectedMemoContents := make(map[int32]string, len(memos))
+	for _, memo := range memos {
+		expectedMemoContents[memo.ID] = memo.Content
+		references, err := s.extractManagedAttachmentReferences(memo.Content)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to read the file")
+			return nil, status.Errorf(codes.FailedPrecondition, "memo contains an invalid managed attachment reference: %v", err)
 		}
-		return blob, nil
+		for _, reference := range references {
+			if _, deleting := deletingUIDs[reference.UID]; deleting {
+				return nil, status.Errorf(codes.FailedPrecondition, "attachment %s is referenced by memo content", reference.UID)
+			}
+		}
 	}
-	// For S3 storage, download the file from S3.
-	if attachment.StorageType == storepb.AttachmentStorageType_S3 {
-		if attachment.Payload == nil {
-			return nil, errors.New("attachment payload is missing")
-		}
-		s3Object := attachment.Payload.GetS3Object()
-		if s3Object == nil {
-			return nil, errors.New("S3 object payload is missing")
-		}
-		if s3Object.S3Config == nil {
-			return nil, errors.New("S3 config is missing")
-		}
-		if s3Object.Key == "" {
-			return nil, errors.New("S3 object key is missing")
-		}
 
-		s3Client, err := s3.NewClient(context.Background(), s3Object.S3Config)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to create S3 client")
-		}
-
-		blob, err := s3Client.GetObject(context.Background(), s3Object.Key)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to get object from S3")
-		}
-		return blob, nil
-	}
-	// For database storage, return the blob from the database.
-	return attachment.Blob, nil
+	return expectedMemoContents, nil
 }
 
-var fileKeyPattern = regexp.MustCompile(`\{[a-z]{1,9}\}`)
-
-func replaceFilenameWithPathTemplate(path, filename string) string {
-	t := time.Now()
-	path = fileKeyPattern.ReplaceAllStringFunc(path, func(s string) string {
-		switch s {
-		case "{filename}":
-			return filename
-		case "{timestamp}":
-			return fmt.Sprintf("%d", t.Unix())
-		case "{year}":
-			return fmt.Sprintf("%d", t.Year())
-		case "{month}":
-			return fmt.Sprintf("%02d", t.Month())
-		case "{day}":
-			return fmt.Sprintf("%02d", t.Day())
-		case "{hour}":
-			return fmt.Sprintf("%02d", t.Hour())
-		case "{minute}":
-			return fmt.Sprintf("%02d", t.Minute())
-		case "{second}":
-			return fmt.Sprintf("%02d", t.Second())
-		case "{uuid}":
-			return util.GenUUID()
-		default:
-			return s
+func (s *APIV1Service) validateAttachmentMotionGroupDeletion(
+	ctx context.Context,
+	user *store.User,
+	attachments []*store.Attachment,
+) (map[string]struct{}, error) {
+	if user == nil || len(attachments) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "attachments are required")
+	}
+	deletingUIDs := make(map[string]struct{}, len(attachments))
+	motionGroupIDs := make(map[string]struct{})
+	for _, attachment := range attachments {
+		if attachment == nil || attachment.ID <= 0 || attachment.UID == "" {
+			return nil, status.Error(codes.InvalidArgument, "invalid attachment")
 		}
-	})
-	return path
+		if attachment.CreatorID != user.ID {
+			return nil, status.Error(codes.PermissionDenied, "permission denied")
+		}
+		deletingUIDs[attachment.UID] = struct{}{}
+		if motion := getAttachmentMotionMedia(attachment); motion != nil && motion.GroupId != "" {
+			motionGroupIDs[motion.GroupId] = struct{}{}
+		}
+	}
+	if len(motionGroupIDs) == 0 {
+		return deletingUIDs, nil
+	}
+
+	creatorAttachments, err := s.Store.ListAttachments(ctx, &store.FindAttachment{CreatorID: &user.ID, SkipDefaultLimit: true})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list motion media group: %v", err)
+	}
+	for _, candidate := range creatorAttachments {
+		motion := getAttachmentMotionMedia(candidate)
+		if motion == nil {
+			continue
+		}
+		if _, selectedGroup := motionGroupIDs[motion.GroupId]; !selectedGroup {
+			continue
+		}
+		if _, deleting := deletingUIDs[candidate.UID]; !deleting {
+			return nil, status.Errorf(codes.FailedPrecondition, "motion media group %s must be deleted together", motion.GroupId)
+		}
+	}
+	return deletingUIDs, nil
 }
 
-func ensureUniqueLocalAttachmentPath(path, uid string) string {
-	if _, err := os.Stat(path); err != nil {
-		return path
-	}
-
-	ext := filepath.Ext(path)
-	base := strings.TrimSuffix(path, ext)
-	return base + "_" + uid + ext
-}
-
-func validateFilename(filename string) bool {
-	// Reject path traversal attempts and make sure no additional directories are created
-	if !filepath.IsLocal(filename) || strings.ContainsAny(filename, "/\\") {
-		return false
-	}
-
-	// Reject filenames starting or ending with spaces or periods
-	if strings.HasPrefix(filename, " ") || strings.HasSuffix(filename, " ") ||
-		strings.HasPrefix(filename, ".") || strings.HasSuffix(filename, ".") {
-		return false
-	}
-
-	return true
-}
-
-func normalizeMimeType(mimeType string) (string, bool) {
-	mimeType = strings.TrimSpace(mimeType)
-	if mimeType == "" || len(mimeType) > 255 {
-		return "", false
-	}
-
-	mediaType, _, err := mime.ParseMediaType(mimeType)
-	if err != nil || mediaType == "" || len(mediaType) > 255 {
-		return "", false
-	}
-
-	return mediaType, true
-}
-
-func (s *APIV1Service) validateAttachmentFilter(ctx context.Context, filterStr string) error {
-	if filterStr == "" {
-		return errors.New("filter cannot be empty")
-	}
-
-	engine, err := filter.DefaultAttachmentEngine()
+func (s *APIV1Service) deleteAttachmentsAtomically(ctx context.Context, user *store.User, attachments []*store.Attachment) error {
+	expectedMemoContents, err := s.validateAttachmentDeletionPreflight(ctx, user, attachments)
 	if err != nil {
 		return err
 	}
-
-	var dialect filter.DialectName
-	switch s.Profile.Driver {
-	case "mysql":
-		dialect = filter.DialectMySQL
-	case "postgres":
-		dialect = filter.DialectPostgres
-	default:
-		dialect = filter.DialectSQLite
+	attachmentIDs := make([]int32, 0, len(attachments))
+	for _, attachment := range attachments {
+		attachmentIDs = append(attachmentIDs, attachment.ID)
 	}
-
-	if _, err := engine.CompileToStatement(ctx, filterStr, filter.RenderOptions{Dialect: dialect}); err != nil {
-		return errors.Wrap(err, "failed to compile filter")
+	if err := s.Store.DeleteAttachmentsWithPolicy(ctx, &store.AttachmentDeletionPolicy{
+		ActorUserID:          user.ID,
+		ExpectedMemoContents: expectedMemoContents,
+	}, attachmentIDs); err != nil {
+		return mapMemoWriteError(err, "failed to delete attachments")
+	}
+	if attachmentsIncludeMemo(attachments) {
+		s.SSEHub.publishMemoChanged()
+	}
+	if err := s.cleanupDeletedAttachmentStorage(ctx, attachments); err != nil {
+		return status.Errorf(codes.Internal, "attachments were deleted but storage cleanup failed: %v", err)
 	}
 	return nil
+}
+
+func attachmentsIncludeMemo(attachments []*store.Attachment) bool {
+	for _, attachment := range attachments {
+		if attachment != nil && attachment.MemoID != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // checkAttachmentAccess verifies the user has permission to access the attachment.
 // For unlinked attachments (no memo), only the creator can access.
 // For linked attachments, access follows the memo's visibility rules.
 func (s *APIV1Service) checkAttachmentAccess(ctx context.Context, attachment *store.Attachment) error {
-	user, _ := s.fetchCurrentUser(ctx)
-
 	// For unlinked attachments, only the creator can access.
 	if attachment.MemoID == nil {
+		user, err := s.fetchCurrentUser(ctx)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to get current user")
+		}
 		if user == nil {
 			return status.Errorf(codes.Unauthenticated, "user not authenticated")
 		}
-		if attachment.CreatorID != user.ID && !isSuperUser(user) {
+		if attachment.CreatorID != user.ID {
 			return status.Errorf(codes.PermissionDenied, "permission denied")
 		}
 		return nil
@@ -684,104 +643,5 @@ func (s *APIV1Service) checkAttachmentAccess(ctx context.Context, attachment *st
 		return status.Errorf(codes.NotFound, "memo not found")
 	}
 
-	if memo.Visibility == store.Public {
-		return nil
-	}
-	if user == nil {
-		return status.Errorf(codes.Unauthenticated, "user not authenticated")
-	}
-	if memo.Visibility == store.Private && memo.CreatorID != user.ID && !isSuperUser(user) {
-		return status.Errorf(codes.PermissionDenied, "permission denied")
-	}
-	return nil
-}
-
-func validateClientMotionMedia(motion *v1pb.MotionMedia, attachmentUID string) (*storepb.MotionMedia, error) {
-	if motion == nil {
-		return nil, nil
-	}
-
-	if motion.Family != v1pb.MotionMediaFamily_APPLE_LIVE_PHOTO {
-		return nil, status.Errorf(codes.InvalidArgument, "only Apple Live Photo motion metadata can be provided by clients")
-	}
-	if motion.Role != v1pb.MotionMediaRole_STILL && motion.Role != v1pb.MotionMediaRole_VIDEO {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid Apple Live Photo motion role")
-	}
-
-	storeMotion := convertMotionMediaToStore(motion)
-	if storeMotion.GroupId == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "motion media group_id is required")
-	}
-	if storeMotion.Family == storepb.MotionMediaFamily_ANDROID_MOTION_PHOTO && storeMotion.GroupId == "" {
-		storeMotion.GroupId = attachmentUID
-	}
-
-	return storeMotion, nil
-}
-
-func detectAndroidMotionMedia(blob []byte, mimeType, attachmentUID string) *storepb.MotionMedia {
-	if mimeType != "image/jpeg" && mimeType != "image/jpg" {
-		return nil
-	}
-
-	detection := motionphoto.DetectJPEG(blob)
-	if detection == nil {
-		return nil
-	}
-
-	return &storepb.MotionMedia{
-		Family:                  storepb.MotionMediaFamily_ANDROID_MOTION_PHOTO,
-		Role:                    storepb.MotionMediaRole_CONTAINER,
-		GroupId:                 attachmentUID,
-		PresentationTimestampUs: detection.PresentationTimestampUs,
-		HasEmbeddedVideo:        true,
-	}
-}
-
-// shouldStripExif checks if the MIME type is an image format that may contain EXIF metadata.
-// Returns true for formats like JPEG, TIFF, WebP, HEIC, and HEIF which commonly contain
-// privacy-sensitive metadata such as GPS coordinates, camera settings, and device information.
-func shouldStripExif(mimeType string) bool {
-	return exifCapableImageTypes[mimeType]
-}
-
-// stripImageExif removes EXIF metadata from image files by decoding and re-encoding them.
-// This prevents exposure of sensitive metadata such as GPS location, camera details, and timestamps.
-//
-// The function preserves the correct image orientation by applying EXIF orientation tags
-// during decoding before stripping all metadata. Images are re-encoded with high quality
-// to minimize visual degradation.
-//
-// Supported formats:
-//   - JPEG/JPG: Re-encoded as JPEG with quality 95
-//   - PNG: Re-encoded as PNG (lossless)
-//   - TIFF/WebP/HEIC/HEIF: Re-encoded as JPEG with quality 95
-//
-// Returns the cleaned image data without any EXIF metadata, or an error if processing fails.
-func stripImageExif(imageData []byte, mimeType string) ([]byte, error) {
-	// Decode image with automatic EXIF orientation correction.
-	// This ensures the image displays correctly after metadata removal.
-	img, err := imaging.Decode(bytes.NewReader(imageData), imaging.AutoOrientation(true))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to decode image")
-	}
-
-	// Re-encode the image without EXIF metadata.
-	var buf bytes.Buffer
-	var encodeErr error
-
-	if mimeType == "image/png" {
-		// Preserve PNG format for lossless encoding
-		encodeErr = imaging.Encode(&buf, img, imaging.PNG)
-	} else {
-		// For JPEG, TIFF, WebP, HEIC, HEIF - re-encode as JPEG.
-		// This ensures EXIF is stripped and provides good compression.
-		encodeErr = imaging.Encode(&buf, img, imaging.JPEG, imaging.JPEGQuality(defaultJPEGQuality))
-	}
-
-	if encodeErr != nil {
-		return nil, errors.Wrap(encodeErr, "failed to encode image")
-	}
-
-	return buf.Bytes(), nil
+	return s.checkMemoReadAccess(ctx, memo)
 }

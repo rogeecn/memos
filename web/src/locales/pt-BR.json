@@ -23,7 +23,6 @@
     "archive": "Arquivar",
     "archived": "Arquivo",
     "attachments": "Anexos",
-    "auto-expand": "Expandir automaticamente",
     "avatar": "Avatar",
     "basic": "Básico",
     "beta": "Beta",
@@ -65,6 +64,7 @@
     "last-updated-at": "Atualizado em",
     "learn-more": "Saiba mais",
     "link": "Link",
+    "manage": "Gerenciar",
     "map": "Mapa",
     "mark": "Vincular",
     "memo": "Memo",
@@ -95,8 +95,6 @@
     "select": "Selecionar",
     "settings": "Ajustes",
     "share": "Compartilhar",
-    "shortcut-filter": "Filtro de atalhos",
-    "shortcuts": "Atalhos",
     "sign-in": "Entrar",
     "sign-in-with": "Entrar com {{provider}}",
     "sign-out": "Sair",
@@ -114,7 +112,11 @@
     "username": "Nome de usuário",
     "version": "Versão",
     "visibility": "Visibilidade",
+    "views": "Vistas",
     "yourself": "Você mesmo"
+  },
+  "locale-picker": {
+    "no-language-feedback": "Idioma não encontrado? Enviar comentários"
   },
   "editor": {
     "add-your-comment-here": "Adicione seu comentário aqui…",
@@ -123,8 +125,6 @@
     "focus-mode": "Modo Foco",
     "no-changes-detected": "Nenhuma alteração detectada",
     "save": "Salvar",
-    "saving": "Salvando…",
-    "slash-commands": "Digite `/` para comandos",
     "insert-menu": {
       "add-location": "Adicionar local",
       "link-memo": "Vincular memorando",
@@ -189,9 +189,12 @@
     "filters": {
       "has-code": "temCódigo",
       "has-link": "temLink",
+      "has-location": "tem localização",
       "has-task-list": "temListaDeTarefas",
       "label": "Filtros"
     },
+    "compact-mode": "Modo compacto",
+    "link-preview": "Pré-visualização de links",
     "links": "Links",
     "load-more": "Carregar mais",
     "no-archived-memos": "Nenhum memo arquivado.",
@@ -253,8 +256,7 @@
     "restored-successfully": "Restaurado com êxito",
     "succeed-copy-content": "Conteúdo copiado com êxito.",
     "succeed-copy-link": "Link copiado com êxito.",
-    "update-succeed": "Atualizado com êxito",
-    "user-not-found": "Usuário não encontrado"
+    "update-succeed": "Atualizado com êxito"
   },
   "reference": {
     "add-references": "Adicionar referências",
@@ -330,9 +332,9 @@
       "theme": "Tema",
       "label": "Preferências"
     },
-    "shortcut": {
-      "delete-confirm": "Tem certeza de que deseja deletar o atalho `{{title}}`?",
-      "delete-success": "Atalho `{{title}}` deletado com êxito"
+    "memo-view": {
+      "delete-confirm": "Tem certeza de que deseja excluir a vista `{{title}}`?",
+      "delete-success": "Vista `{{title}}` excluída com sucesso"
     },
     "sso": {
       "authorization-endpoint": "Endpoint de autenticação",
@@ -374,7 +376,6 @@
       "path": "Caminho do armazenamento",
       "path-description": "Você pode usar as mesmas variáveis dinâmicas do armazenamento local, como {filename}",
       "path-placeholder": "caminho",
-      "presign-placeholder": "URL pré-assinado, opcional",
       "region": "Região",
       "region-placeholder": "Nome da região",
       "s3-compatible-url": "URL compatível com S3",

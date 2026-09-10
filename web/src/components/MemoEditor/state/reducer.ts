@@ -1,5 +1,5 @@
 import type { EditorAction, EditorState } from "./types";
-import { initialState } from "./types";
+import { createInitialState } from "./types";
 
 export function editorReducer(state: EditorState, action: EditorAction): EditorState {
   switch (action.type) {
@@ -7,15 +7,21 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       return {
         ...state,
         content: action.payload.content,
+        contentSource: "external",
         metadata: action.payload.metadata,
         timestamps: action.payload.timestamps,
       };
 
-    case "UPDATE_CONTENT":
+    case "UPDATE_CONTENT": {
+      if (state.content === action.payload.content && state.contentSource === action.payload.source) {
+        return state;
+      }
       return {
         ...state,
-        content: action.payload,
+        content: action.payload.content,
+        contentSource: action.payload.source,
       };
+    }
 
     case "SET_METADATA":
       return {
@@ -23,42 +29,6 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         metadata: {
           ...state.metadata,
           ...action.payload,
-        },
-      };
-
-    case "ADD_ATTACHMENT":
-      return {
-        ...state,
-        metadata: {
-          ...state.metadata,
-          attachments: [...state.metadata.attachments, action.payload],
-        },
-      };
-
-    case "REMOVE_ATTACHMENT":
-      return {
-        ...state,
-        metadata: {
-          ...state.metadata,
-          attachments: state.metadata.attachments.filter((a) => a.name !== action.payload),
-        },
-      };
-
-    case "ADD_RELATION":
-      return {
-        ...state,
-        metadata: {
-          ...state.metadata,
-          relations: [...state.metadata.relations, action.payload],
-        },
-      };
-
-    case "REMOVE_RELATION":
-      return {
-        ...state,
-        metadata: {
-          ...state.metadata,
-          relations: state.metadata.relations.filter((r) => r.relatedMemo?.name !== action.payload),
         },
       };
 
@@ -78,12 +48,6 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       return {
         ...state,
         localFiles: action.payload,
-      };
-
-    case "CLEAR_LOCAL_FILES":
-      return {
-        ...state,
-        localFiles: [],
       };
 
     case "TOGGLE_FOCUS_MODE":
@@ -107,12 +71,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         },
       };
 
-    case "SET_COMPOSING":
+    case "SET_PENDING_INLINE_IMAGE_INSERTIONS":
       return {
         ...state,
         ui: {
           ...state.ui,
-          isComposing: action.payload,
+          pendingInlineImageInsertions: action.payload,
         },
       };
 
@@ -125,56 +89,23 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         },
       };
 
-    case "SET_AUDIO_RECORDER_SUPPORT":
+    case "SET_RECORDER_BUSY":
       return {
         ...state,
-        audioRecorder: {
-          ...state.audioRecorder,
-          isSupported: action.payload,
-          status: action.payload ? state.audioRecorder.status : "unsupported",
-        },
+        recorderBusy: action.payload,
       };
 
-    case "SET_AUDIO_RECORDER_PERMISSION":
+    case "SET_JUST_SAVED":
       return {
         ...state,
-        audioRecorder: {
-          ...state.audioRecorder,
-          permission: action.payload,
-        },
-      };
-
-    case "SET_AUDIO_RECORDER_STATUS":
-      return {
-        ...state,
-        audioRecorder: {
-          ...state.audioRecorder,
-          status: action.payload,
-        },
-      };
-
-    case "SET_AUDIO_RECORDER_ELAPSED":
-      return {
-        ...state,
-        audioRecorder: {
-          ...state.audioRecorder,
-          elapsedSeconds: action.payload,
-        },
-      };
-
-    case "SET_AUDIO_RECORDER_ERROR":
-      return {
-        ...state,
-        audioRecorder: {
-          ...state.audioRecorder,
-          error: action.payload,
+        ui: {
+          ...state.ui,
+          justSaved: action.payload,
         },
       };
 
     case "RESET":
-      return {
-        ...initialState,
-      };
+      return createInitialState();
 
     default:
       return state;

@@ -2,11 +2,9 @@ package filter
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
-	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/ext"
 )
 
 // DialectName enumerates supported SQL dialects.
@@ -32,9 +30,11 @@ const (
 type FieldKind string
 
 const (
-	FieldKindScalar       FieldKind = "scalar"
-	FieldKindBoolColumn   FieldKind = "bool_column"
-	FieldKindJSONBool     FieldKind = "json_bool"
+	FieldKindScalar     FieldKind = "scalar"
+	FieldKindBoolColumn FieldKind = "bool_column"
+	FieldKindJSONBool   FieldKind = "json_bool"
+	// FieldKindJSONExists represents a boolean derived from the presence of a non-null JSON value.
+	FieldKindJSONExists   FieldKind = "json_exists"
 	FieldKindJSONList     FieldKind = "json_list"
 	FieldKindVirtualAlias FieldKind = "virtual_alias"
 )
@@ -86,16 +86,6 @@ func (s Schema) ResolveAlias(name string) (Field, bool) {
 	}
 	return field, true
 }
-
-var nowFunction = cel.Function("now",
-	cel.Overload("now",
-		[]*cel.Type{},
-		cel.IntType,
-		cel.FunctionBinding(func(_ ...ref.Val) ref.Val {
-			return types.Int(time.Now().Unix())
-		}),
-	),
-)
 
 // NewSchema constructs the memo filter schema and CEL environment.
 func NewSchema() Schema {
@@ -182,6 +172,20 @@ func NewSchema() Schema {
 				CompareNeq: true,
 			},
 		},
+		"space": {
+			Name:   "space",
+			Kind:   FieldKindScalar,
+			Type:   FieldTypeString,
+			Column: Column{Table: "memo_space", Name: "uid"},
+			Expressions: map[DialectName]string{
+				DialectSQLite:   "CASE WHEN `memo`.`space_id` IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE ('spaces/' || %[1]s) END",
+				DialectMySQL:    "CASE WHEN `memo`.`space_id` IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE CONCAT('spaces/', %[1]s) END",
+				DialectPostgres: "CASE WHEN memo.space_id IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE ('spaces/' || %[1]s) END",
+			},
+			AllowedComparisonOps: map[ComparisonOperator]bool{
+				CompareEq: true,
+			},
+		},
 		"tags": {
 			Name:     "tags",
 			Kind:     FieldKindJSONList,
@@ -239,23 +243,39 @@ func NewSchema() Schema {
 				CompareNeq: true,
 			},
 		},
+		"has_location": {
+			Name:     "has_location",
+			Kind:     FieldKindJSONExists,
+			Type:     FieldTypeBool,
+			Column:   Column{Table: "memo", Name: "payload"},
+			JSONPath: []string{"location"},
+			AllowedComparisonOps: map[ComparisonOperator]bool{
+				CompareEq:  true,
+				CompareNeq: true,
+			},
+		},
 	}
 
 	envOptions := []cel.EnvOption{
 		cel.Variable("content", cel.StringType),
 		cel.Variable("creator", cel.StringType),
 		cel.Variable("creator_id", cel.IntType),
-		cel.Variable("created_ts", cel.IntType),
-		cel.Variable("updated_ts", cel.IntType),
+		cel.Variable("created_ts", cel.TimestampType),
+		cel.Variable("updated_ts", cel.TimestampType),
 		cel.Variable("pinned", cel.BoolType),
 		cel.Variable("tag", cel.StringType),
 		cel.Variable("tags", cel.ListType(cel.StringType)),
 		cel.Variable("visibility", cel.StringType),
+		// Dyn permits the explicit null comparison used for memos without a space.
+		cel.Variable("space", cel.DynType),
 		cel.Variable("has_task_list", cel.BoolType),
 		cel.Variable("has_link", cel.BoolType),
 		cel.Variable("has_code", cel.BoolType),
 		cel.Variable("has_incomplete_tasks", cel.BoolType),
-		nowFunction,
+		cel.Variable("has_location", cel.BoolType),
+		cel.Variable("now", cel.TimestampType),
+		ext.Sets(),
+		cel.ASTValidators(cel.ValidateRegexLiterals()),
 	}
 
 	return Schema{
@@ -277,11 +297,12 @@ func NewAttachmentSchema() Schema {
 			Expressions:      map[DialectName]string{},
 		},
 		"mime_type": {
-			Name:        "mime_type",
-			Kind:        FieldKindScalar,
-			Type:        FieldTypeString,
-			Column:      Column{Table: "attachment", Name: "type"},
-			Expressions: map[DialectName]string{},
+			Name:             "mime_type",
+			Kind:             FieldKindScalar,
+			Type:             FieldTypeString,
+			Column:           Column{Table: "attachment", Name: "type"},
+			SupportsContains: true,
+			Expressions:      map[DialectName]string{},
 		},
 		"create_time": {
 			Name:   "create_time",
@@ -307,14 +328,30 @@ func NewAttachmentSchema() Schema {
 				CompareNeq: true,
 			},
 		},
+		"space": {
+			Name:   "space",
+			Kind:   FieldKindScalar,
+			Type:   FieldTypeString,
+			Column: Column{Table: "attachment_space", Name: "uid"},
+			Expressions: map[DialectName]string{
+				DialectSQLite:   "CASE WHEN `attachment`.`memo_id` IS NULL OR `memo`.`space_id` IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE ('spaces/' || %[1]s) END",
+				DialectMySQL:    "CASE WHEN `attachment`.`memo_id` IS NULL OR `memo`.`space_id` IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE CONCAT('spaces/', %[1]s) END",
+				DialectPostgres: "CASE WHEN attachment.memo_id IS NULL OR memo.space_id IS NULL THEN NULL WHEN %[1]s IS NULL THEN '' ELSE ('spaces/' || %[1]s) END",
+			},
+			AllowedComparisonOps: map[ComparisonOperator]bool{
+				CompareEq: true,
+			},
+		},
 	}
 
 	envOptions := []cel.EnvOption{
 		cel.Variable("filename", cel.StringType),
 		cel.Variable("mime_type", cel.StringType),
-		cel.Variable("create_time", cel.IntType),
+		cel.Variable("create_time", cel.TimestampType),
 		cel.Variable("memo_id", cel.AnyType),
-		nowFunction,
+		cel.Variable("space", cel.DynType),
+		cel.Variable("now", cel.TimestampType),
+		cel.ASTValidators(cel.ValidateRegexLiterals()),
 	}
 
 	return Schema{

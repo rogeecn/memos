@@ -1,11 +1,13 @@
 import { create } from "@bufbuild/protobuf";
 import { FileIcon } from "lucide-react";
-import { extractMemoIdFromName } from "@/helpers/resource-names";
+import { useMemo } from "react";
+import { extractMemoIdFromName } from "@/lib/resource-names";
 import { cn } from "@/lib/utils";
 import type { Attachment } from "@/types/proto/api/v1/attachment_service_pb";
 import { MemoSchema } from "@/types/proto/api/v1/memo_service_pb";
 import type { User } from "@/types/proto/api/v1/user_service_pb";
 import { getAttachmentType, isMotionAttachment } from "@/utils/attachment";
+import { filterInlineManagedAttachments } from "@/utils/managed-attachment";
 import { buildAttachmentVisualItems, countLogicalAttachmentItems } from "@/utils/media-item";
 import MemoContent from "../MemoContent";
 import { MemoViewContext, type MemoViewContextValue } from "../MemoView/MemoViewContext";
@@ -55,6 +57,7 @@ const AttachmentThumbnails = ({ attachments }: { attachments: Attachment[] }) =>
             alt={item.filename}
             className="w-10 h-10 rounded border border-border object-cover bg-muted/40"
             loading="lazy"
+            decoding="async"
           />
           {item.kind === "motion" && (
             <span className="absolute left-1 top-1 rounded bg-black/70 px-1 py-0.5 text-[8px] font-semibold leading-none text-white">
@@ -113,7 +116,8 @@ const MemoPreview = ({
   truncate = false,
 }: MemoPreviewProps) => {
   const hasContent = content.trim().length > 0;
-  const hasAttachments = attachments.length > 0;
+  const attachmentOnlyItems = useMemo(() => filterInlineManagedAttachments(content, attachments), [content, attachments]);
+  const hasAttachments = attachmentOnlyItems.length > 0;
   const showMeta = showCreator || showMemoId;
 
   if (!hasContent && !hasAttachments) {
@@ -128,7 +132,13 @@ const MemoPreview = ({
       <div className="text-sm text-muted-foreground truncate min-w-0">No content</div>
     )
   ) : (
-    hasContent && <MemoContent content={content} compact={compact} />
+    // Previews are inert (pointer-events-none), so a static CSS bound replaces the
+    // interactive clamp a full memo card gets.
+    hasContent && (
+      <div className="max-h-36 w-full overflow-hidden">
+        <MemoContent content={content} attachments={attachments} compact={compact} />
+      </div>
+    )
   );
 
   return (
@@ -147,10 +157,10 @@ const MemoPreview = ({
           (truncate ? (
             <div className="shrink-0 text-muted-foreground/70 inline-flex justify-center items-center gap-0.5">
               <FileIcon className="w-3 h-3 inline-block" />
-              <span className="text-xs">{countLogicalAttachmentItems(attachments)}</span>
+              <span className="text-xs">{countLogicalAttachmentItems(attachmentOnlyItems)}</span>
             </div>
           ) : (
-            <AttachmentThumbnails attachments={attachments} />
+            <AttachmentThumbnails attachments={attachmentOnlyItems} />
           ))}
       </div>
     </MemoViewContext.Provider>

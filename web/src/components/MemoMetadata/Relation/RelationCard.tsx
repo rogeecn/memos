@@ -1,4 +1,5 @@
 import MemoSnippetLink from "@/components/MemoView/components/MemoSnippetLink";
+import { createMemoNavigationState } from "@/components/MemoView/navigation";
 import type { MemoRelation_Memo } from "@/types/proto/api/v1/memo_service_pb";
 
 interface RelationCardProps {
@@ -9,7 +10,13 @@ interface RelationCardProps {
 
 const RelationCard = ({ memo, parentPage, className }: RelationCardProps) => {
   return (
-    <MemoSnippetLink name={memo.name} snippet={memo.snippet} to={`/${memo.name}`} state={{ from: parentPage }} className={className} />
+    <MemoSnippetLink
+      name={memo.name}
+      snippet={memo.snippet}
+      to={`/${memo.name}`}
+      state={parentPage ? createMemoNavigationState(parentPage) : undefined}
+      className={className}
+    />
   );
 };
 
